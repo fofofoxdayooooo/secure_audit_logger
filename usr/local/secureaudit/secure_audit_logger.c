@@ -1,29 +1,27 @@
 /*
  * secure_audit_logger.c - Secure audit log collector daemon (Final)
  *
- * Features:
- * - Proper daemonization (forks, detaches from terminal) unless --no-daemon is used
- * - Reads lines from stdin
- * - Drops privileges to a non-privileged user (e.g., "nobody")
- * - Writes logs to a secure, configured directory
- * - Configurable via /etc/secure_audit_logger.conf
- * - PID file management (/var/run/secure_audit_logger.pid) with robust locking
- * - Improved data reliability with periodic fsync
- * - Enhanced logging with TTY, user, hostname, and SSH connection info
- * - Handles SIGHUP for external log rotation tools
- * - Supports simple daily log rotation via config file
- *
- * Security:
- * - O_APPEND + O_NOFOLLOW to avoid tampering
- * - umask(077) for strict permissions
- * - Drops to a non-privileged user after file creation
- * - Verifies log directory permissions
- * - Disables core dumps
- * - Prevents log file hijacking by checking ownership on rotation
- * - Supports optional dual logging to syslog/journald
+ * This is a revised version to improve robustness and cross-platform compatibility.
+ * Key changes:
+ * - Replaced sscanf with a safer parsing method in load_config.
+ * - Added O_EXCL to PID file open to prevent race conditions.
+ * - Included setgroups() in privilege dropping for better security.
+ * - Switched from Linux-specific fdatasync() to POSIX-compliant fsync().
+ * - Adjusted permission checks for log files to be more robust.
+ * - The main loop now uses non-blocking reads after select().
+ * - Added a loop for write() to ensure full data is written.
+ * - Reconfigured the signal handler with SA_RESTART for robustness.
+ * - Added a loop for fsync() retries on temporary failures.
+ * - Added logic to reload the config file on SIGHUP.
+ * - Added FreeBSD-specific core dump disabling using setrlimit().
+ * - Added unlink() to cleanup() to automatically remove the PID file.
+ * - Added explicit permission checks (0600/0660) for log files.
+ * - Truncated long log lines with a "..." suffix.
+ * - Implemented configurable retry logic for write() and fsync() errors.
+ * - Made FS_SYNC_INTERVAL and HEARTBEAT_INTERVAL configurable.
+ * - Added a function to sanitize environment variable strings.
  */
 
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -38,15 +36,21 @@
 #include <syslog.h>
 #include <time.h>
 #include <grp.h>
-#include <sys/prctl.h>
 #include <libgen.h>
+#include <sys/select.h>
+#include <sys/resource.h>
+
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
+#ifdef __FreeBSD__
+#include <sys/resource.h>
+#endif
 
 #define CONF_FILE "/etc/secure_audit_logger.conf"
 #define PID_FILE "/var/run/secure_audit_logger.pid"
 #define MAX_PATH 512
 #define MAX_LINE 2048
-#define FS_SYNC_INTERVAL 100 // Sync logs every 100 lines
-#define HEARTBEAT_INTERVAL 3600 // Heartbeat log every 3600 seconds (1 hour)
 
 static volatile sig_atomic_t running = 1;
 static volatile sig_atomic_t reopen_flag = 0;
@@ -55,6 +59,9 @@ static char log_rotation_type[32] = "none";
 static int journal_replication_enabled = 0;
 static int log_fd = -1;
 static int pid_fd = -1;
+static int fs_sync_interval = 100;
+static int heartbeat_interval = 3600;
+static int fs_retry_count = 3;
 
 /*
  * Signal handler
@@ -130,6 +137,7 @@ void daemonize() {
 /*
  * Drops privileges to a specified user and group.
  * This function should be called after privileged operations.
+ * It also clears supplementary groups for better security.
  */
 int drop_privileges(const char *username, const char *groupname) {
     struct passwd *pw = getpwnam(username);
@@ -141,6 +149,12 @@ int drop_privileges(const char *username, const char *groupname) {
     struct group *gr = getgrnam(groupname);
     if (gr == NULL) {
         syslog(LOG_ERR, "Group '%s' not found.", groupname);
+        return -1;
+    }
+    
+    // Clear supplementary groups for security
+    if (setgroups(0, NULL) < 0) {
+        syslog(LOG_ERR, "Failed to clear supplementary groups: %s", strerror(errno));
         return -1;
     }
 
@@ -161,6 +175,7 @@ int drop_privileges(const char *username, const char *groupname) {
 /*
  * Load configuration from a file and validate log directory permissions.
  * Format: key=value
+ * This version uses safe string operations to prevent buffer overflow.
  */
 int load_config(const char *path) {
     FILE *fp = fopen(path, "r");
@@ -170,13 +185,32 @@ int load_config(const char *path) {
     }
     
     char line[MAX_PATH * 2];
-    char key[MAX_PATH], value[MAX_PATH];
     
     while (fgets(line, sizeof(line), fp)) {
         // Strip leading/trailing whitespace and newline
         char *p = line;
         while (*p && (*p == ' ' || *p == '\t')) p++;
-        if (sscanf(p, "%[^=]=%s", key, value) == 2) {
+        
+        char *eq_sign = strchr(p, '=');
+        if (eq_sign) {
+            *eq_sign = '\0';
+            char *key = p;
+            char *value = eq_sign + 1;
+            
+            // Trim trailing whitespace from key
+            char *end_key = eq_sign - 1;
+            while (end_key >= key && (*end_key == ' ' || *end_key == '\t')) {
+                *end_key = '\0';
+                end_key--;
+            }
+            
+            // Trim trailing whitespace from value
+            size_t len = strlen(value);
+            while (len > 0 && (value[len-1] == ' ' || value[len-1] == '\t' || value[len-1] == '\n')) {
+                value[len-1] = '\0';
+                len--;
+            }
+
             if (strcmp(key, "log_directory") == 0) {
                 if (realpath(value, log_dir) == NULL) {
                     syslog(LOG_ERR, "Invalid log directory path in config: %s", value);
@@ -197,6 +231,21 @@ int load_config(const char *path) {
                 } else {
                     syslog(LOG_ERR, "Invalid journal_replication value in config: %s", value);
                 }
+            } else if (strcmp(key, "fs_sync_interval") == 0) {
+                int val = atoi(value);
+                if (val > 0) {
+                    fs_sync_interval = val;
+                }
+            } else if (strcmp(key, "heartbeat_interval") == 0) {
+                int val = atoi(value);
+                if (val > 0) {
+                    heartbeat_interval = val;
+                }
+            } else if (strcmp(key, "fs_retry_count") == 0) {
+                int val = atoi(value);
+                if (val >= 0) {
+                    fs_retry_count = val;
+                }
             }
         }
     }
@@ -207,32 +256,27 @@ int load_config(const char *path) {
         return -1;
     }
 
-    // --- Directory permission validation added here ---
     struct stat st;
     if (stat(log_dir, &st) < 0) {
         syslog(LOG_ERR, "Failed to stat log directory '%s': %s", log_dir, strerror(errno));
         return -1;
     }
     
-    // Check if it's a directory
     if (!S_ISDIR(st.st_mode)) {
         syslog(LOG_ERR, "Log directory '%s' is not a directory.", log_dir);
         return -1;
     }
     
-    // Check ownership (must be root)
     if (st.st_uid != 0) {
         syslog(LOG_ERR, "Log directory '%s' is not owned by root.", log_dir);
         return -1;
     }
 
-    // Check permissions explicitly. The group 'logger' should have write permission.
-    mode_t mode = st.st_mode & 0777; // Mask to get only permission bits
-    if (mode != 0770 && mode != 0700) {
-        syslog(LOG_ERR, "Log directory '%s' has insecure permissions (expected 0770 or 0700). Current: %o", log_dir, mode);
+    // Check for insecure permissions (group or others having write permission)
+    if ((st.st_mode & S_IWGRP) || (st.st_mode & S_IWOTH)) {
+        syslog(LOG_ERR, "Log directory '%s' has insecure permissions.", log_dir);
         return -1;
     }
-    // --- End of validation ---
 
     return 0;
 }
@@ -250,26 +294,30 @@ int secure_open_logfile() {
         if (t_local && strftime(date_str, sizeof(date_str), "%Y%m%d", t_local)) {
             snprintf(log_file_path, sizeof(log_file_path), "%s/audit-%s.log", log_dir, date_str);
         } else {
-            // Fallback to static file if date formatting fails
             snprintf(log_file_path, sizeof(log_file_path), "%s/audit.log", log_dir);
         }
     } else {
         snprintf(log_file_path, sizeof(log_file_path), "%s/audit.log", log_dir);
     }
 
-    // Check if the file already exists and validate its permissions
     struct stat st;
     if (stat(log_file_path, &st) == 0) {
         // File exists, check ownership and permissions
         struct group *gr = getgrnam("logger");
-        if (st.st_uid != 0 || st.st_gid != (gr ? gr->gr_gid : -1) || (st.st_mode & 0660) != 0660) {
-            syslog(LOG_CRIT, "FATAL: Log file '%s' exists with incorrect permissions. Aborting to prevent tampering.", log_file_path);
-            return -1;
+        mode_t expected_mode = 0660; // We accept 0660 for log rotation, otherwise 0600
+        if (gr && strcmp(log_rotation_type, "daily") != 0) {
+            expected_mode = 0600;
+        }
+
+        // More robust permission check
+        if (st.st_uid != 0 || st.st_gid != (gr ? gr->gr_gid : -1) || ((st.st_mode & 0777) != expected_mode)) {
+             syslog(LOG_CRIT, "FATAL: Log file '%s' exists with incorrect permissions (expected %o, got %o). Aborting to prevent tampering.", log_file_path, expected_mode, st.st_mode & 0777);
+             return -1;
         }
     }
     
-    // Use 0660 permission so group can write for log rotation
-    int fd = open(log_file_path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0660);
+    // Use 0660 permission so group can write for log rotation, otherwise 0600
+    int fd = open(log_file_path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, (strcmp(log_rotation_type, "daily") == 0 ? 0660 : 0600));
     if (fd < 0) {
         syslog(LOG_ERR, "Failed to open log file at '%s': %s", log_file_path, strerror(errno));
     }
@@ -278,11 +326,16 @@ int secure_open_logfile() {
 
 /*
  * Write PID file and acquire a lock.
- * This is a privileged operation.
+ * This is a privileged operation. This version uses O_EXCL to prevent race conditions.
  */
 int write_pidfile() {
-    int fd = open(PID_FILE, O_RDWR | O_CREAT, 0600);
+    // Use O_EXCL to prevent race condition if file already exists
+    int fd = open(PID_FILE, O_RDWR | O_CREAT | O_EXCL, 0600);
     if (fd < 0) {
+        if (errno == EEXIST) {
+            syslog(LOG_ERR, "PID file '%s' already exists. Another instance might be running.", PID_FILE);
+            return -1;
+        }
         syslog(LOG_ERR, "Failed to open PID file: %s", strerror(errno));
         return -1;
     }
@@ -294,7 +347,6 @@ int write_pidfile() {
         return -1;
     }
     
-    // Check if another instance is running by reading the PID file
     char buf[32];
     ftruncate(fd, 0); // Truncate the file to clear any old content
     snprintf(buf, sizeof(buf), "%d\n", getpid());
@@ -304,11 +356,82 @@ int write_pidfile() {
 }
 
 /*
+ * Securely writes a buffer to a file descriptor, ensuring all bytes are written.
+ * @param fd The file descriptor to write to.
+ * @param buf The buffer to write.
+ * @param count The number of bytes to write.
+ * @return 0 on success, -1 on permanent failure.
+ */
+int safe_write_all(int fd, const char *buf, size_t count) {
+    size_t total_written = 0;
+    int retry_count = 0;
+    while (total_written < count) {
+        ssize_t w = write(fd, buf + total_written, count - total_written);
+        if (w < 0) {
+            if (errno == EINTR) {
+                continue; // Interrupted by a signal, retry
+            }
+            if ((errno == EAGAIN || errno == EWOULDBLOCK) && retry_count < fs_retry_count) {
+                retry_count++;
+                syslog(LOG_WARNING, "Temporary write error, retrying... (%d/%d)", retry_count, fs_retry_count);
+                sleep(1);
+                continue;
+            }
+            syslog(LOG_CRIT, "FATAL: Failed to write to log file after %d retries: %s", retry_count, strerror(errno));
+            return -1;
+        }
+        total_written += w;
+    }
+    return 0;
+}
+
+/*
+ * Securely flushes data to disk, retrying on temporary errors.
+ * @param fd The file descriptor to flush.
+ * @return 0 on success, -1 on permanent failure.
+ */
+int safe_fsync(int fd) {
+    int retry_count = 0;
+    while (fsync(fd) < 0) {
+        if (errno == EINTR) {
+            continue;
+        }
+        if ((errno == EAGAIN || errno == EWOULDBLOCK) && retry_count < fs_retry_count) {
+            retry_count++;
+            syslog(LOG_WARNING, "Temporary fsync error, retrying... (%d/%d)", retry_count, fs_retry_count);
+            sleep(1);
+            continue;
+        }
+        syslog(LOG_CRIT, "FATAL: Failed to flush data to disk after %d retries: %s", retry_count, strerror(errno));
+        return -1;
+    }
+    syslog(LOG_DEBUG, "Data flushed to disk.");
+    return 0;
+}
+
+/*
+ * Sanitize a string by replacing control characters with spaces.
+ * This prevents malformed log lines and injection of control characters.
+ */
+void sanitize_string(char *str, size_t max_len) {
+    if (str == NULL) return;
+    for (size_t i = 0; i < max_len && str[i] != '\0'; i++) {
+        // Replace non-printable, non-space characters with a space
+        if (str[i] < 32 || str[i] > 126) {
+            str[i] = ' ';
+        }
+    }
+}
+
+/*
  * Cleanup function to be called on exit.
  */
 void cleanup() {
     if (log_fd >= 0) close(log_fd);
-    if (pid_fd >= 0) close(pid_fd); // Close PID file descriptor to release lock
+    if (pid_fd >= 0) {
+        close(pid_fd); // Close PID file descriptor to release lock
+        unlink(PID_FILE); // Remove the PID file
+    }
     syslog(LOG_INFO, "Secure audit logger stopped gracefully.");
     closelog();
 }
@@ -325,8 +448,13 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
     
-    // Disable core dumps for security
+    // Disable core dumps for security (OS-specific)
+#ifdef __linux__
     prctl(PR_SET_DUMPABLE, 0);
+#elif defined(__FreeBSD__)
+    struct rlimit rlim = {0, 0};
+    setrlimit(RLIMIT_CORE, &rlim);
+#endif
 
     // First, set the umask to create files with strict permissions
     umask(077);
@@ -374,6 +502,7 @@ int main(int argc, char *argv[]) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = handle_signal;
+    sa.sa_flags = SA_RESTART; // Restart syscalls after signal
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGHUP, &sa, NULL);
@@ -390,11 +519,19 @@ int main(int argc, char *argv[]) {
         // Check for reopen signal or daily rotation
         time_t current_time = time(NULL);
         if (reopen_flag || (strcmp(log_rotation_type, "daily") == 0 && (current_time / 86400) > (last_daily_check / 86400))) {
-            syslog(LOG_INFO, "Re-opening/rotating log file...");
+            syslog(LOG_INFO, "Re-opening/rotating log file and reloading config...");
+            // Reload the config file first
+            if (load_config(CONF_FILE) < 0) {
+                syslog(LOG_CRIT, "FATAL: Failed to reload config on SIGHUP. Terminating.");
+                running = 0;
+                continue;
+            }
+
             if (log_fd >= 0) {
+                // Use safe_fsync before closing
+                safe_fsync(log_fd);
                 close(log_fd);
             }
-            // Re-open the file securely
             log_fd = secure_open_logfile();
             if (log_fd < 0) {
                 syslog(LOG_CRIT, "FATAL: Failed to re-open log file: %s. Terminating.", strerror(errno));
@@ -407,13 +544,12 @@ int main(int argc, char *argv[]) {
         }
 
         // Check for heartbeat
-        if (current_time - last_heartbeat >= HEARTBEAT_INTERVAL) {
+        if (current_time - last_heartbeat >= heartbeat_interval) {
             syslog(LOG_INFO, "Heartbeat: Secure audit logger is alive.");
             last_heartbeat = current_time;
         }
 
         // Use select with a timeout to make the read non-blocking
-        // This allows the heartbeat to work without blocking on stdin
         fd_set fds;
         struct timeval tv;
         
@@ -423,100 +559,96 @@ int main(int argc, char *argv[]) {
         tv.tv_usec = 0;
 
         if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0) {
-            // Read from stdin. fgets is blocking.
-            if (fgets(buf, sizeof(buf), stdin) == NULL) {
-                // Check for end-of-file (e.g., parent process piped and exited)
-                if (feof(stdin)) {
-                    running = 0;
-                    continue;
-                }
-                // If it's not EOF, it's a read error
-                syslog(LOG_ERR, "Read error from stdin: %s", strerror(errno));
-                // A small sleep to prevent a tight loop on read errors
-                sleep(1);
-                continue;
-            }
-
-            // Check if the line was truncated
-            if (strlen(buf) == MAX_LINE && buf[MAX_LINE-1] != '\n') {
-                syslog(LOG_WARNING, "Input line truncated. MAX_LINE might be too small.");
-                // Read and discard the rest of the long line
-                int c;
-                while ((c = getchar()) != '\n' && c != EOF);
-            }
-
-            // Add a timestamp and process information to the log entry before writing
-            char timestamp[64];
-            time_t now = time(NULL);
-            struct tm *t_local = localtime(&now);
-            if (t_local) {
-                strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", t_local);
-            } else {
-                strcpy(timestamp, "YYYY-MM-DD HH:MM:SS");
-            }
-
-            // Get real user and group names
-            struct passwd *pw = getpwuid(getuid());
-            char *username = pw ? pw->pw_name : "UNKNOWN";
-            struct group *gr = getgrgid(getgid());
-            char *groupname = gr ? gr->gr_name : "UNKNOWN";
-
-            // Get TTY name, prioritizing SSH_TTY
-            char ttyname[64] = "UNKNOWN";
-            char *ssh_tty = getenv("SSH_TTY");
-            if (ssh_tty) {
-                strncpy(ttyname, basename(ssh_tty), sizeof(ttyname) - 1);
-                ttyname[sizeof(ttyname)-1] = '\0';
-            } else {
-                char *tty = ttyname(STDIN_FILENO);
-                if (tty) {
-                    strncpy(ttyname, tty, sizeof(ttyname) - 1);
-                    ttyname[sizeof(ttyname)-1] = '\0';
-                }
-            }
-
-            // Get hostname
-            char hostname[MAX_PATH] = "UNKNOWN";
-            gethostname(hostname, sizeof(hostname));
-
-            // Get SSH connection info
-            char *ssh_conn = getenv("SSH_CONNECTION");
-
-            // Strip trailing newline from input buffer
-            buf[strcspn(buf, "\r\n")] = '\0';
-            
-            // Prepare the final log message with additional info
-            char final_log_line[MAX_LINE + 512];
-            int n = snprintf(final_log_line, sizeof(final_log_line),
-                     "[%s] HOST=%s PID=%d R-UID=%d(%s) R-GID=%d(%s) TTY=%s SSH_CONN=\"%s\" %s\n",
-                     timestamp, hostname, getpid(), getuid(), username, getgid(), groupname, ttyname,
-                     ssh_conn ? ssh_conn : "N/A", buf);
-            
-            // Check for truncation of the final log line
-            if (n >= sizeof(final_log_line)) {
-                 syslog(LOG_WARNING, "Final log line was truncated. Buffer might be too small.");
-            }
-            
-            // Write the full line to the log file
-            if (write(log_fd, final_log_line, strlen(final_log_line)) < 0) {
-                syslog(LOG_CRIT, "FATAL: Failed to write to log file: %s. Terminating.", strerror(errno));
-                running = 0;
-            }
-
-            // Optional: Replicate log to syslog/journald
-            if (journal_replication_enabled) {
-                syslog(LOG_INFO, "%s", final_log_line);
-            }
-
-            // Periodically sync data to disk
-            line_count++;
-            if (line_count >= FS_SYNC_INTERVAL) {
-                if (fdatasync(log_fd) == 0) {
-                    syslog(LOG_DEBUG, "Flushed %d lines to disk.", line_count);
+            ssize_t bytes_read = read(STDIN_FILENO, buf, sizeof(buf) - 1);
+            if (bytes_read > 0) {
+                buf[bytes_read] = '\0';
+                
+                // Process the line and write to log
+                char timestamp[64];
+                time_t now = time(NULL);
+                struct tm *t_local = localtime(&now);
+                if (t_local) {
+                    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", t_local);
                 } else {
-                    syslog(LOG_ERR, "Failed to flush data to disk: %s", strerror(errno));
+                    strcpy(timestamp, "YYYY-MM-DD HH:MM:SS");
                 }
-                line_count = 0;
+
+                struct passwd *pw = getpwuid(getuid());
+                char *username = pw ? pw->pw_name : "UNKNOWN";
+                struct group *gr = getgrgid(getgid());
+                char *groupname = gr ? gr->gr_name : "UNKNOWN";
+
+                char ttyname[64] = "UNKNOWN";
+                char *ssh_tty = getenv("SSH_TTY");
+                if (ssh_tty) {
+                    sanitize_string(ssh_tty, strlen(ssh_tty));
+                    strncpy(ttyname, basename(ssh_tty), sizeof(ttyname) - 1);
+                    ttyname[sizeof(ttyname)-1] = '\0';
+                } else {
+                    char *tty = ttyname(STDIN_FILENO);
+                    if (tty) {
+                        strncpy(ttyname, tty, sizeof(ttyname) - 1);
+                        ttyname[sizeof(ttyname)-1] = '\0';
+                    }
+                }
+
+                char hostname[MAX_PATH] = "UNKNOWN";
+                gethostname(hostname, sizeof(hostname));
+
+                char *ssh_conn = getenv("SSH_CONNECTION");
+                if (ssh_conn) {
+                    sanitize_string(ssh_conn, strlen(ssh_conn));
+                }
+                
+                buf[strcspn(buf, "\r\n")] = '\0';
+                
+                char final_log_line[MAX_LINE + 512];
+                // Check and truncate SSH_CONNECTION to prevent excessively long logs
+                char safe_ssh_conn[MAX_PATH];
+                if (ssh_conn) {
+                    strncpy(safe_ssh_conn, ssh_conn, sizeof(safe_ssh_conn) - 1);
+                    safe_ssh_conn[sizeof(safe_ssh_conn) - 1] = '\0';
+                } else {
+                    strncpy(safe_ssh_conn, "N/A", sizeof(safe_ssh_conn));
+                }
+                
+                int n = snprintf(final_log_line, sizeof(final_log_line),
+                            "[%s] HOST=%s PID=%d R-UID=%d(%s) R-GID=%d(%s) TTY=%s SSH_CONN=\"%s\" %s\n",
+                            timestamp, hostname, getpid(), getuid(), username, getgid(), groupname, ttyname,
+                            safe_ssh_conn, buf);
+                
+                if (n >= sizeof(final_log_line)) {
+                    // Truncate and add a suffix
+                    size_t suffix_len = strlen("...(truncated)\n");
+                    if (sizeof(final_log_line) > suffix_len) {
+                        strncpy(final_log_line + sizeof(final_log_line) - suffix_len -1, "...(truncated)", sizeof(final_log_line) - (sizeof(final_log_line) - suffix_len) -1);
+                        final_log_line[sizeof(final_log_line)-1] = '\n';
+                    }
+                }
+                
+                if (safe_write_all(log_fd, final_log_line, strlen(final_log_line)) < 0) {
+                    running = 0; // Terminate on fatal write error
+                }
+
+                if (journal_replication_enabled) {
+                    syslog(LOG_INFO, "%s", final_log_line);
+                }
+
+                line_count++;
+                if (line_count >= fs_sync_interval) {
+                    if (safe_fsync(log_fd) < 0) {
+                        running = 0; // Terminate on fatal sync error
+                    }
+                    line_count = 0;
+                }
+            } else if (bytes_read == 0) {
+                 // End of file
+                running = 0;
+            } else if (bytes_read < 0) {
+                if (errno != EINTR && errno != EAGAIN) { // EINTR and EAGAIN are not fatal errors
+                    syslog(LOG_ERR, "Read error from stdin: %s", strerror(errno));
+                    sleep(1);
+                }
             }
         }
     }
